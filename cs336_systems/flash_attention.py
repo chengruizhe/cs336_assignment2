@@ -6,7 +6,6 @@ import triton
 import triton.language as tl
 from jaxtyping import Float
 import einx
-import einops
 
 
 class FlashAttentionPytorch(torch.autograd.Function):
@@ -18,7 +17,7 @@ class FlashAttentionPytorch(torch.autograd.Function):
         K: Float[Tensor, "... k d"],
         V: Float[Tensor, "... k dv"],
         is_causal: bool = False,
-    ) -> tuple[Float[Tensor, "... q dv"], Float[Tensor, "... q"]]:
+    ) -> Float[Tensor, "... q dv"]:
         assert not is_causal
         assert Q.shape[-1] == K.shape[-1]
         assert K.shape[-2] == V.shape[-2]
@@ -91,8 +90,40 @@ class FlashAttentionPytorch(torch.autograd.Function):
         return O
 
     @staticmethod
-    def backward(ctx: Any):
-        raise NotImplementedError
+    def backward(
+        ctx: Any,
+        dO: Float[Tensor, "... q dv"],
+    ):
+        Q, K, V, O, L = ctx.saved_tensors
+        d = Q.shape[-1]
+
+        D = O * dO
+        D = torch.sum(D, dim=-1, keepdim=True)
+
+        inv_sqrt_d = 1 / math.sqrt(d)
+        S = (
+            einx.dot(
+                "... q d, ... k d -> ... q k",
+                Q,
+                K,
+            )
+            * inv_sqrt_d
+        )
+        P = torch.exp(S - L.unsqueeze(-1))
+        dV = einx.dot(
+            "... q k, ... q dv -> ... k dv",
+            P,
+            dO,
+        )
+        dP = einx.dot(
+            "... q dv, ... k dv -> ... q k",
+            dO,
+            V,
+        )
+        dS = P * (dP - D)  # ... q k
+        dQ = einx.dot("... q k, ... k d -> ... q d", dS, K) * inv_sqrt_d
+        dK = einx.dot("... q k, ... q d -> ... k d", dS, Q) * inv_sqrt_d
+        return dQ, dK, dV, None
 
 
 @triton.jit
