@@ -126,6 +126,39 @@ class FlashAttentionPytorch(torch.autograd.Function):
         return dQ, dK, dV, None
 
 
+FLASH_FWD_AUTOTUNE_CONFIGS = [
+    triton.Config(
+        {"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16},
+        num_warps=2,
+        num_stages=2,
+    ),
+    triton.Config(
+        {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 16},
+        num_warps=4,
+        num_stages=2,
+    ),
+    triton.Config(
+        {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32},
+        num_warps=4,
+        num_stages=3,
+    ),
+    triton.Config(
+        {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 32},
+        num_warps=8,
+        num_stages=3,
+    ),
+    triton.Config(
+        {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64},
+        num_warps=8,
+        num_stages=4,
+    ),
+]
+
+
+@triton.autotune(
+    configs=FLASH_FWD_AUTOTUNE_CONFIGS,
+    key=["N_QUERIES", "N_KEYS", "D", "is_causal"],
+)
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr,
@@ -215,13 +248,13 @@ def flash_fwd_kernel(
 
     for k_tile_idx in range(n_k_tiles):
         k_start = k_tile_idx * K_TILE_SIZE
-        k_end = k_start + K_TILE_SIZE - 1
 
         k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
         v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
         s = tl.dot(q, k) * scale
 
-        if is_causal and not (k_end <= q_start):
+        if is_causal:
+            # Keep masking in tensor form to avoid runtime Python branching in-kernel.
             offs_k = k_start + tl.arange(0, K_TILE_SIZE)
             mask = offs_q[:, None] >= offs_k[None, :]
             s = tl.where(mask, s, -1e6)
@@ -269,10 +302,6 @@ class FlashAttentionTriton(torch.autograd.Function):
         B, N_QUERIES, D = Q.shape
         _, N_KEYS, _ = K.shape
 
-        # Choose tile sizes. These can be tuned later.
-        Q_TILE_SIZE = 32
-        K_TILE_SIZE = 32
-
         O = torch.empty_like(Q)
         L = torch.empty(
             (B, N_QUERIES),
@@ -283,10 +312,7 @@ class FlashAttentionTriton(torch.autograd.Function):
         # Triton launch grid:
         #   pid(0) = batch_index
         #   pid(1) = query_tile_index
-        grid = (
-            B,
-            triton.cdiv(N_QUERIES, Q_TILE_SIZE),
-        )
+        grid = lambda META: (B, triton.cdiv(N_QUERIES, META["Q_TILE_SIZE"]))
 
         scale = 1.0 / math.sqrt(D)
 
@@ -314,8 +340,6 @@ class FlashAttentionTriton(torch.autograd.Function):
             N_KEYS,
             scale,
             D=D,
-            Q_TILE_SIZE=Q_TILE_SIZE,
-            K_TILE_SIZE=K_TILE_SIZE,
             is_causal=is_causal,
         )
 
@@ -323,8 +347,6 @@ class FlashAttentionTriton(torch.autograd.Function):
         ctx.save_for_backward(Q, K, V, O, L)
         ctx.is_causal = is_causal
         ctx.scale = scale
-        ctx.Q_TILE_SIZE = Q_TILE_SIZE
-        ctx.K_TILE_SIZE = K_TILE_SIZE
 
         return O
 
