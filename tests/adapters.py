@@ -149,4 +149,10 @@ def get_sharded_optimizer(
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    from cs336_systems.optimizer_sharding import StateShardingOptimizer
+
+    return StateShardingOptimizer(
+        params,
+        optimizer_cls=optimizer_cls,
+        **kwargs,
+    )
